@@ -1,85 +1,241 @@
-# New-LogEntry Function - Version 2.0.1
+# New-LogEntry
 
-New-LogEntry is a flexible yet powerful PowerShell function aimed to make scripts logging and troubleshooting an easier process. 
+`New-LogEntry` is a PowerShell 7.1+ logging function designed for production automation and troubleshooting. It writes timestamped log entries to files and the console, supports in-memory buffering, handles concurrent writers safely, accepts pipeline input, and can redact common secrets before log data leaves the process.
 
-**New-LogEntry** by default will write log messages both to the configured log file and the host console making eliminating the need to *follow* log files during debug of production code.
+The function began as a small logging helper and has since been rewritten around a clearer public API, private helper functions, cross-platform file handling, and automated Pester tests.
 
-Starting with version **2.0.0** of the function all log messages will be prepended with an of the available tags unless the *-NoTag* parameter is used:
+## Requirements
 
-- **[INFO]** default tag for all log messages
-- **[WARNINNG]** which will also use *Write-WARNINNG* cmdlet to print a warning on console
-- **[ERROR]** which will also use *Write-ERROR* cmdlet to print an error message on console 
+- PowerShell 7.1 or later
+- Pester 5 or later to run the test suite
 
-If no log file is specified function will default to  current script path on a file named *ScriptName-LogFile-CurrentDate.log*
+The current implementation targets PowerShell 7.1+ on Windows, Linux, and macOS. Windows PowerShell 5.1 and earlier versions are not a compatibility target for this release.
 
-## Sample Usage
+## Repository layout
 
-Documentation of the function is available through online PowerShell help some sample usage and output are documented below.
-
-### Write Message to log file
-
-```powershell
-# Will write message to C:\Temp\TestLog.log
-New-LogEntry -LogMessage 'This is a test message' -LogFilePath  'C:\Temp\TestLog.log'
+```text
+New-LogEntry/
+├── New-LogEntry.ps1
+├── Public/
+│   └── New-LogEntry.ps1
+├── Private/
+│   ├── Add-NewLogEntryBuffer.ps1
+│   ├── Clear-NewLogEntryBuffer.ps1
+│   ├── ConvertTo-NewLogEntryRedactedMessage.ps1
+│   ├── Flush-NewLogEntryBuffer.ps1
+│   ├── Format-NewLogEntry.ps1
+│   ├── Get-NewLogEntryBuffer.ps1
+│   ├── Get-NewLogEntryMutexName.ps1
+│   ├── Initialize-NewLogEntryState.ps1
+│   ├── Resolve-NewLogEntryPath.ps1
+│   ├── Write-NewLogEntryConsole.ps1
+│   └── Write-NewLogEntryLines.ps1
+├── Tests/
+│   └── New-LogEntry.Tests.ps1
+├── CHANGELOG.md
+└── LICENSE
 ```
 
-Content of the *TestLog.log* file will be
+`New-LogEntry.ps1` at the project root is the loader. It imports the private helper functions first and then exposes the public `New-LogEntry` function.
 
-> [02.29.2020 08:27:01 AM] - [INFO]: This is a test message
+## Quick start
 
-### Write message to log file without tag
-
-```powershell
-# Wrill write message without any prepending tag
-New-LogEntry -LogMessage 'This is a test message without tag' -NoTag -LogFilePath  'C:\Temp\TestLog.log'
-```
-
-Content of the *TestLog.log* file will be
-
-> [02.29.2020 08:27:01 AM] : This is a test message without tag
-
-### Write warning message to log file
+Dot-source the loader:
 
 ```powershell
-# Will write message to C:\Temp\TestLog.log
-New-LogEntry -LogMessage 'This is a WARNINNG message' -IsWARNINNGMessage -LogFilePath  'C:\Temp\TestLog.log'
+. ./New-LogEntry.ps1
 ```
 
-Content of the *TestLog.log* file will be
-
-> [02.29.2020 08:27:01 AM] : [WARNINNG] - This is a WARNINNG message
-
-### Write error message to log file
+Write a standard informational entry:
 
 ```powershell
-# Will write message to C:\Temp\TestLog.log
-New-LogEntry -LogMessage 'This is an ERROR message' -IsERRORMessage -LogFilePath  'C:\Temp\TestLog.log'
+New-LogEntry -LogMessage 'Application started' -LogFilePath './application.log'
 ```
 
-Content of the *TestLog.log* file will be
-
-> [02.29.2020 08:28:05 AM] :  [ERROR] - This is an ERROR message
-
-### Write message to buffer
+Write warning and error entries:
 
 ```powershell
-# No output will be printed on screen 
-New-LogEntry -LogMessage 'This message will only be in buffer' -BufferOnly
-New-LogEntry -LogMessage 'This is a second message in buffer' -BufferOnly
-
-# Print buffer content
-$messageBuffer
-
-[02.29.2020 08:27:01 AM] [INFO] : This message will only be in buffer
-[02.29.2020 08:29:03 AM] [INFO] : This is another message in buffer
+New-LogEntry -LogMessage 'Configuration value missing' -Level WARNING -LogFilePath './application.log'
+New-LogEntry -LogMessage 'Operation failed' -Level ERROR -LogFilePath './application.log'
 ```
 
-**Note:** When using the *BufferOnly* switch and writing content on screen everything will be printed on a single line but when piping buffer's content to a file it will be properly formatted.
+`INFO` is the default level.
 
-### Write message to log file only
+## Output behavior
+
+By default, entries are written to both the configured log file and the console.
+
+Use `-NoConsole` when running unattended automation:
 
 ```powershell
-New-LogEntry -LogMessage 'This is another message in buffer' -NoConsole -LogFilePath  'C:\Temp\TestLog.log'
+New-LogEntry -LogMessage 'Background task started' -LogFilePath './task.log' -NoConsole
 ```
 
-The above will write log message to the designated log file but will suppress any output on console, useful when running non interactively.
+Normal informational console output uses `Write-Host` so log messages do not unexpectedly pollute the PowerShell success pipeline.
+
+When caller code needs the formatted entry as output, use `-PassThru`:
+
+```powershell
+$entry = New-LogEntry `
+    -LogMessage 'Return this line' `
+    -LogFilePath './application.log' `
+    -NoConsole `
+    -PassThru
+```
+
+## Pipeline input
+
+`New-LogEntry` accepts messages from the pipeline:
+
+```powershell
+'one', 'two', 'three' | New-LogEntry -LogFilePath './application.log'
+```
+
+Pipeline input is collected during processing and written in one operation at the end of the invocation, reducing lock acquisition and file-write overhead.
+
+Multiline messages are split so each physical line receives its own timestamp and severity prefix:
+
+```powershell
+New-LogEntry -LogMessage "Line one`nLine two" -LogFilePath './application.log'
+```
+
+## In-memory buffering
+
+Log entries can be buffered instead of immediately written:
+
+```powershell
+New-LogEntry -LogMessage 'Step one complete' -BufferOnly
+New-LogEntry -LogMessage 'Step two complete' -BufferOnly
+```
+
+Inspect the current buffer:
+
+```powershell
+New-LogEntry -GetBuffer
+```
+
+Flush buffered entries to disk and clear the buffer after a successful write:
+
+```powershell
+New-LogEntry -FlushBuffer -LogFilePath './application.log' -NoConsole
+```
+
+Clear the buffer without writing it:
+
+```powershell
+New-LogEntry -ClearBuffer
+```
+
+Buffer snapshot, file write and removal are synchronized as one operation. Failed
+writes retain entries for retry; only the written prefix is removed on success.
+A partial filesystem write can leave content on disk, so retrying after an I/O
+failure does not guarantee exactly-once delivery.
+
+Without `-LogFilePath`, logs are created beside the calling script, or in the
+current directory for interactive calls. Specify a path for a stable filename. Callers should interact with the buffer through the public parameters rather than accessing the backing state directly.
+
+## Concurrent file writes
+
+File writes are protected by a named system mutex derived from the resolved log-file path. This prevents concurrent PowerShell processes writing to the same log file from interleaving or dropping entries while allowing unrelated log files to proceed independently.
+
+The default lock timeout is 30 seconds and can be changed with `-LockTimeoutSeconds`:
+
+```powershell
+New-LogEntry `
+    -LogMessage 'Concurrent-safe write' `
+    -LogFilePath './application.log' `
+    -LockTimeoutSeconds 10
+```
+
+Abandoned mutexes are handled so a failed writer does not permanently block later writes.
+
+## Secret redaction
+
+Secret redaction is opt-in.
+
+Use `-RedactSecrets` to remove common credential patterns before entries are buffered, written, displayed, or returned:
+
+```powershell
+New-LogEntry `
+    -LogMessage 'Authorization: Bearer abc123 password=SuperSecret' `
+    -LogFilePath './application.log' `
+    -RedactSecrets
+```
+
+Custom regular expressions can be supplied with `-RedactPattern`:
+
+```powershell
+New-LogEntry `
+    -LogMessage 'sessionId=abc123 visible=yes' `
+    -LogFilePath './application.log' `
+    -RedactPattern 'sessionId=\S+'
+```
+
+Use `-RedactionText` to change the replacement text:
+
+```powershell
+New-LogEntry `
+    -LogMessage 'token=abc123' `
+    -LogFilePath './application.log' `
+    -RedactSecrets `
+    -RedactionText '<secret>'
+```
+
+`-RedactionText` is literal text: dollar signs are not expanded as regex substitutions.
+
+Redaction reduces accidental credential exposure in logs, but it should not be treated as a substitute for proper secret-management practices.
+
+## Backward-compatible severity switches
+
+The preferred severity interface is `-Level`, but the legacy switches remain available for existing callers:
+
+```powershell
+New-LogEntry -LogMessage 'Warning' -IsWarningMessage -LogFilePath './application.log'
+New-LogEntry -LogMessage 'Failure' -IsErrorMessage -LogFilePath './application.log'
+```
+
+Combining multiple buffered severity switches is rejected. Individual switches remain supported.
+
+Mixing `-Level` with a legacy severity switch is rejected rather than silently choosing one behavior.
+
+## Tests
+
+The project includes a Pester 5 test suite covering the current behavioral contract, including:
+
+- informational, warning, and error logging
+- legacy severity switches
+- conflicting parameter combinations
+- multiline messages
+- pipeline batching
+- buffering, flushing, and clearing
+- pass-through output
+- built-in and custom secret redaction, including literal replacement text
+- default paths from calling scripts and interactive sessions
+- buffer retention and retry after failed writes
+- simultaneous direct and buffered writes from three processes
+
+Install Pester if necessary:
+
+```powershell
+Install-Module Pester -Scope CurrentUser
+```
+
+Run the suite from the `New-LogEntry` directory:
+
+```powershell
+Invoke-Pester ./Tests
+```
+
+## History
+
+The full development history is documented in [CHANGELOG.md](./CHANGELOG.md).
+
+## License
+
+Released under the [MIT License](./LICENSE).
+
+## Validation scope
+
+This repository includes the revised standalone test suites. Run them locally with Pester 5. The matching implementation in PowerShell-Functions has a Windows, Linux and macOS workflow; this repository does not yet include that workflow. A successful run on one host does not establish compatibility with every supported PowerShell version.
+
+PowerShell 7.1 is the API minimum because the mutex helper uses .NET 5 APIs. CI tests the runner versions, not every historical PowerShell release.
